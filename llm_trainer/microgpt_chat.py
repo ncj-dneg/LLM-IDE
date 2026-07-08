@@ -118,7 +118,7 @@ class MicroGPTChatSession:
                 logits = self.model(idx_cond)[:, -1, :]
                 logits = self._apply_repeat_penalty(logits, generated_ids, repeat_penalty)
                 next_id = self._sample_next_token(logits, temperature, top_p)
-                if next_id == self.eos_id:
+                if next_id == self.eos_id and generated_ids:
                     break
                 ids = torch.cat((ids, torch.tensor([[next_id]], dtype=torch.long, device=self.device)), dim=1)
                 generated_ids.append(next_id)

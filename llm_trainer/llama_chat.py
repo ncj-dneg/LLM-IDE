@@ -46,14 +46,28 @@ class LlamaChatSession:
         self.model_path = Path(model_path)
         self._lock = Lock()
         self._messages: list[dict[str, str]] = []
-        self._llm = Llama(
-            model_path=str(self.model_path),
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            n_gpu_layers=n_gpu_layers,
-            offload_kqv=n_gpu_layers != 0,
-            verbose=False,
-        )
+        try:
+            self._llm = Llama(
+                model_path=str(self.model_path),
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                n_gpu_layers=n_gpu_layers,
+                offload_kqv=n_gpu_layers != 0,
+                verbose=False,
+            )
+        except ValueError as exc:
+            file_size = self.model_path.stat().st_size if self.model_path.exists() else 0
+            hints = []
+            if file_size == 0:
+                hints.append("The file is empty — the download may have failed.")
+            elif file_size < 1_000_000:
+                hints.append(f"The file is very small ({file_size:,} bytes) — it may be incomplete or corrupted.")
+            if any(c > 127 for c in str(self.model_path).encode("utf-8", errors="replace")):
+                hints.append("The path contains non-ASCII characters — try moving the model to a simple path.")
+            detail = " ".join(hints) if hints else "Verify the file is a valid GGUF model and is fully downloaded."
+            raise ValueError(
+                f"Failed to load GGUF model: {self.model_path}\n{detail}"
+            ) from exc
 
     @property
     def runtime_summary(self) -> str:
