@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import torch
@@ -97,13 +98,19 @@ class Lion(torch.optim.Optimizer):
 
 
 class TokenDataset(Dataset):
-    """Sliding-window token dataset for next-token prediction."""
+    """Sliding-window token dataset for next-token prediction.
 
-    def __init__(self, tokens: list[int], context_length: int, stride: int = 1) -> None:
+    Accepts a list of ints, a numpy array, or a numpy memmap.  When backed by a
+    memmap the full token stream lives on disk — only individual windows are
+    loaded into RAM on each ``__getitem__`` call, so datasets of any size can be
+    used without exhausting system memory.
+    """
+
+    def __init__(self, tokens: Union[list[int], np.ndarray], context_length: int, stride: int = 1) -> None:
         """Create a token dataset.
 
         Args:
-            tokens: Complete token stream.
+            tokens: Complete token stream (list, ndarray, or memmap).
             context_length: Number of input tokens per sample.
             stride: Token offset step between consecutive windows.
 
@@ -115,10 +122,16 @@ class TokenDataset(Dataset):
             raise ValueError("Not enough tokens for the selected context length")
         if stride <= 0:
             raise ValueError("stride must be greater than 0")
-        self.tokens = torch.tensor(tokens, dtype=torch.long)
+        # Keep the backing store as-is (memmap stays on disk).
+        if isinstance(tokens, np.ndarray):
+            self._tokens_np: Optional[np.ndarray] = tokens
+            self._tokens_tensor: Optional[torch.Tensor] = None
+        else:
+            self._tokens_np = None
+            self._tokens_tensor = torch.tensor(tokens, dtype=torch.long)
         self.context_length = context_length
         self.stride = stride
-        available_windows = len(self.tokens) - self.context_length
+        available_windows = len(tokens) - self.context_length
         self.sample_count = (available_windows + self.stride - 1) // self.stride
 
     def __len__(self) -> int:
@@ -141,7 +154,12 @@ class TokenDataset(Dataset):
         """
 
         start = index * self.stride
-        chunk = self.tokens[start : start + self.context_length + 1]
+        end = start + self.context_length + 1
+        if self._tokens_np is not None:
+            # Read the slice from the numpy array / memmap and convert to tensor.
+            chunk = torch.from_numpy(np.array(self._tokens_np[start:end], dtype=np.int64))
+        else:
+            chunk = self._tokens_tensor[start:end]  # type: ignore[index]
         return chunk[:-1], chunk[1:]
 
 
@@ -459,6 +477,7 @@ def evaluate(
                     validation_batches=batch_limit,
                 )
     model.train()
+    _release_cuda_cache()
     return sum(losses) / max(len(losses), 1)
 
 
@@ -697,11 +716,34 @@ def check_resume_compatibility(
     )
 
 
+def _configure_cuda_allocator() -> None:
+    """Configure the CUDA caching allocator to reduce VRAM over-reservation.
+
+    Sets ``expandable_segments:True`` so PyTorch grows GPU memory in smaller
+    increments rather than grabbing large contiguous blocks up front.
+    """
+
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    current = os.environ.get(key, "")
+    if "expandable_segments" not in current:
+        new_value = "expandable_segments:True"
+        if current:
+            new_value = current + "," + new_value
+        os.environ[key] = new_value
+
+
+def _release_cuda_cache() -> None:
+    """Release unused cached VRAM back to the OS."""
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def train_model(
     model_config: ModelConfig,
     training_config: TrainingConfig,
-    train_tokens: list[int],
-    val_tokens: list[int],
+    train_tokens: Union[list[int], np.ndarray],
+    val_tokens: Union[list[int], np.ndarray],
     pad_token_id: int,
     progress: Optional[Callable[[Any], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
@@ -726,12 +768,18 @@ def train_model(
     model_config.validate()
     training_config.validate()
     set_seed(training_config.seed)
+
+    # Reduce VRAM over-reservation by the CUDA caching allocator.
+    if training_config.device.startswith("cuda") and torch.cuda.is_available():
+        _configure_cuda_allocator()
+
     training_config.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = training_config.output_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     emit_progress(progress, "Building model...", 2)
     model = MicroGPT(model_config).to(training_config.device)
+    _release_cuda_cache()
     emit_progress(progress, "Preparing token batches...", 4)
     loader_workers = max(0, int(training_config.data_loader_workers))
     pin_memory = training_config.device.startswith("cuda") and torch.cuda.is_available()
@@ -856,6 +904,7 @@ def train_model(
         if "scheduler_state_dict" in checkpoint and compatibility.can_load_scheduler_state:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         emit_progress(progress, f"Checkpoint loaded at step {global_step}.", 8)
+        _release_cuda_cache()
     else:
         if (
             training_config.training_mode == "fine_tune"
